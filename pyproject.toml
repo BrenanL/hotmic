@@ -1,0 +1,14 @@
+[project]
+name = "voice-type"
+version = "0.1.0"
+description = "Whisper-powered voice dictation tool for Windows"
+requires-python = ">=3.10"
+dependencies = [
+    "RealtimeSTT",
+    "keyboard",
+    "python-dotenv",
+    "requests",
+]
+
+[project.scripts]
+voice-type = "voice_type:main"
