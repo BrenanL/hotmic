@@ -15,10 +15,12 @@ import queue
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from enum import Enum, auto
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+MAX_HISTORY = 5
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +39,143 @@ class Mode(Enum):
 
 
 # ---------------------------------------------------------------------------
+# Win32 helpers
+# ---------------------------------------------------------------------------
+
+def _apply_no_activate(hwnd):
+    """Set WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW on a window handle."""
+    GWL_EXSTYLE = -20
+    WS_EX_NOACTIVATE = 0x08000000
+    WS_EX_TOOLWINDOW = 0x00000080
+    style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    style |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+    SWP_NOACTIVATE = 0x0010
+    SWP_NOMOVE = 0x0002
+    SWP_NOSIZE = 0x0001
+    SWP_FRAMECHANGED = 0x0020
+    ctypes.windll.user32.SetWindowPos(
+        hwnd, 0, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    )
+
+
+def _copy_to_clipboard(text: str):
+    """Copy text to the Windows clipboard via Win32 API (thread-safe)."""
+    global _clipboard_types_set
+    if not _clipboard_types_set:
+        _setup_clipboard_ctypes()
+        _clipboard_types_set = True
+
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+    kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
+    data = text.encode("utf-16-le") + b"\x00\x00"
+
+    if not user32.OpenClipboard(None):
+        time.sleep(0.1)
+        if not user32.OpenClipboard(None):
+            print("[clipboard] Failed to open clipboard")
+            return False
+    try:
+        user32.EmptyClipboard()
+        h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        if not h_mem:
+            print("[clipboard] GlobalAlloc failed")
+            return False
+        p_mem = kernel32.GlobalLock(h_mem)
+        if not p_mem:
+            print("[clipboard] GlobalLock failed")
+            return False
+        ctypes.memmove(p_mem, data, len(data))
+        kernel32.GlobalUnlock(h_mem)
+        user32.SetClipboardData(CF_UNICODETEXT, h_mem)
+    finally:
+        user32.CloseClipboard()
+    return True
+
+
+def _setup_clipboard_ctypes():
+    """Declare proper 64-bit return/arg types for Win32 clipboard functions."""
+    kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_bool
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_bool
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.CloseClipboard.restype = ctypes.c_bool
+    user32.EmptyClipboard.restype = ctypes.c_bool
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+
+
+_clipboard_types_set = False
+
+
+# ---------------------------------------------------------------------------
+# Mini Indicator (tiny recording dot, top-right, shown when overlay hidden)
+# ---------------------------------------------------------------------------
+
+class MiniIndicator:
+    """A tiny always-on-top dot in the top-right corner.
+
+    Visible only when the main overlay is hidden, so the user can tell
+    the tool is still running and whether it's recording.
+    """
+
+    SIZE = 28
+    BG = "#1a1a2e"
+    COLORS = {
+        Status.IDLE: "#555555",
+        Status.RECORDING: "#ff4444",
+        Status.PROCESSING: "#ffaa00",
+    }
+
+    def __init__(self, root: tk.Tk):
+        self._win = tk.Toplevel(root)
+        self._win.overrideredirect(True)
+        self._win.attributes("-topmost", True)
+        self._win.attributes("-alpha", 0.92)
+        self._win.configure(bg=self.BG)
+
+        screen_w = self._win.winfo_screenwidth()
+        x = screen_w - self.SIZE - 12
+        y = 12
+        self._win.geometry(f"{self.SIZE}x{self.SIZE}+{x}+{y}")
+
+        self._dot = tk.Label(
+            self._win, text="\u25cf", bg=self.BG,
+            fg=self.COLORS[Status.IDLE], font=("Segoe UI", 12),
+        )
+        self._dot.pack(expand=True)
+
+        self._win.withdraw()  # hidden by default
+        self._win.after(100, self._apply_styles)
+
+    def _apply_styles(self):
+        try:
+            self._win.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self._win.winfo_id())
+            _apply_no_activate(hwnd)
+        except Exception:
+            pass
+
+    def show(self):
+        self._win.deiconify()
+
+    def hide(self):
+        self._win.withdraw()
+
+    def set_status(self, status: Status):
+        self._dot.config(fg=self.COLORS[status])
+
+
+# ---------------------------------------------------------------------------
 # Overlay Window
 # ---------------------------------------------------------------------------
 
@@ -46,6 +185,7 @@ class Overlay:
     BG = "#1a1a2e"
     FG_TEXT = "#e0e0e0"
     FG_DIM = "#888888"
+    FG_HISTORY = "#aaaaaa"
     STATUS_COLORS = {
         Status.IDLE: "#555555",
         Status.RECORDING: "#ff4444",
@@ -60,8 +200,15 @@ class Overlay:
     def __init__(self, root: tk.Tk):
         self.root = root
         self._queue: queue.Queue = queue.Queue()
+        self._history: deque = deque(maxlen=MAX_HISTORY)
+        self._visible = True
+        self._current_status = Status.IDLE
+
         self._setup_window()
         self._create_widgets()
+        self._make_draggable()
+        self.mini = MiniIndicator(root)
+
         # Defer Win32 tweaks until the window is mapped
         self.root.after(100, self._prevent_focus_steal)
         self._poll_queue()
@@ -77,13 +224,13 @@ class Overlay:
 
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        w, h = 820, 88
+        w, h = 820, 140
         x = (screen_w - w) // 2
-        y = screen_h - h - 60  # just above the taskbar
+        y = screen_h - h - 60
         self.root.geometry(f"{w}x{h}+{x}+{y}")
 
     def _create_widgets(self):
-        # Top row: status dot + label, mode label
+        # Top row: status dot + label, copy button, mode label
         top = tk.Frame(self.root, bg=self.BG)
         top.pack(fill="x", padx=12, pady=(6, 0))
 
@@ -105,40 +252,113 @@ class Overlay:
         )
         self.mode_label.pack(side="right")
 
-        # Main transcription text
-        self.text_label = tk.Label(
-            self.root,
-            text="Ready \u2014 Ctrl+Shift+Space to dictate",
-            fg=self.FG_TEXT, bg=self.BG,
-            font=("Consolas", 11),
-            wraplength=796, justify="left", anchor="w",
+        self.copy_btn = tk.Label(
+            top, text="[Copy]", fg="#6688cc", bg=self.BG,
+            font=("Segoe UI", 9), cursor="hand2",
         )
-        self.text_label.pack(fill="both", expand=True, padx=12, pady=(2, 8))
+        self.copy_btn.pack(side="right", padx=(0, 12))
+        self.copy_btn.bind("<Button-1>", lambda e: self._on_copy_click())
+
+        # Transcript area — read-only Text widget for multi-line history
+        self.text_area = tk.Text(
+            self.root, bg=self.BG, fg=self.FG_TEXT,
+            font=("Consolas", 10), wrap="word",
+            borderwidth=0, highlightthickness=0,
+            padx=12, pady=4,
+            state="disabled",  # read-only
+            cursor="arrow",
+        )
+        self.text_area.pack(fill="both", expand=True, padx=0, pady=(2, 8))
+
+        # Tag styles for history entries vs live text
+        self.text_area.tag_configure("history", foreground=self.FG_HISTORY)
+        self.text_area.tag_configure("live", foreground=self.FG_TEXT)
+        self.text_area.tag_configure(
+            "timestamp", foreground="#666688", font=("Consolas", 8),
+        )
+
+    def _make_draggable(self):
+        """Allow dragging the overlay by clicking anywhere on it."""
+        self._drag_x = 0
+        self._drag_y = 0
+
+        def on_press(e):
+            self._drag_x = e.x
+            self._drag_y = e.y
+
+        def on_drag(e):
+            x = self.root.winfo_x() + (e.x - self._drag_x)
+            y = self.root.winfo_y() + (e.y - self._drag_y)
+            self.root.geometry(f"+{x}+{y}")
+
+        # Bind drag to the root and all child frames/labels
+        for widget in [self.root]:
+            widget.bind("<ButtonPress-1>", on_press)
+            widget.bind("<B1-Motion>", on_drag)
 
     def _prevent_focus_steal(self):
         """Set Win32 extended styles so the overlay never steals focus."""
         try:
             self.root.update_idletasks()
             hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-
-            GWL_EXSTYLE = -20
-            WS_EX_NOACTIVATE = 0x08000000
-            WS_EX_TOOLWINDOW = 0x00000080
-
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            style |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-
-            SWP_NOACTIVATE = 0x0010
-            SWP_NOMOVE = 0x0002
-            SWP_NOSIZE = 0x0001
-            SWP_FRAMECHANGED = 0x0020
-            ctypes.windll.user32.SetWindowPos(
-                hwnd, 0, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-            )
+            _apply_no_activate(hwnd)
         except Exception as exc:
             print(f"[overlay] Could not set WS_EX_NOACTIVATE: {exc}")
+
+    # -- copy ---------------------------------------------------------------
+
+    def _on_copy_click(self):
+        """Copy the latest transcription to clipboard (button click)."""
+        if self._history:
+            _copy_to_clipboard(self._history[-1][1])
+
+    def copy_latest(self):
+        """Copy the latest transcription to clipboard (hotkey)."""
+        if self._history:
+            text = self._history[-1][1]
+            if _copy_to_clipboard(text):
+                self.update(text="Copied to clipboard!")
+                self.update_delayed(1500, text=text)
+
+    # -- visibility ---------------------------------------------------------
+
+    def toggle_visibility(self):
+        """Show/hide the main overlay. Mini indicator mirrors the state."""
+        if self._visible:
+            self.root.withdraw()
+            self.mini.show()
+            self.mini.set_status(self._current_status)
+            self._visible = False
+        else:
+            self.root.deiconify()
+            self.mini.hide()
+            self._visible = True
+
+    # -- history management -------------------------------------------------
+
+    def add_history(self, text: str):
+        """Add a finished transcription to the history ring."""
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self._history.append((ts, text))
+
+    def _render_history(self):
+        """Redraw the text area with the current history."""
+        self.text_area.config(state="normal")
+        self.text_area.delete("1.0", "end")
+
+        if not self._history:
+            self.text_area.insert("end", "Ready \u2014 Ctrl+Alt+Space to dictate",
+                                  "live")
+        else:
+            for i, (ts, entry) in enumerate(self._history):
+                if i > 0:
+                    self.text_area.insert("end", "\n")
+                self.text_area.insert("end", f"[{ts}] ", "timestamp")
+                tag = "live" if i == len(self._history) - 1 else "history"
+                self.text_area.insert("end", entry, tag)
+
+        self.text_area.see("end")
+        self.text_area.config(state="disabled")
 
     # -- thread-safe updates ------------------------------------------------
 
@@ -150,12 +370,23 @@ class Overlay:
                 if kind == "update":
                     _, text, status, mode = msg
                     if text is not None:
-                        self.text_label.config(text=text)
+                        # For simple text updates (live transcription, status
+                        # messages), write directly without touching history.
+                        self.text_area.config(state="normal")
+                        self.text_area.delete("1.0", "end")
+                        self.text_area.insert("end", text, "live")
+                        self.text_area.config(state="disabled")
                     if status is not None:
+                        self._current_status = status
                         self.status_dot.config(fg=self.STATUS_COLORS[status])
                         self.status_label.config(text=self.STATUS_TEXT[status])
+                        self.mini.set_status(status)
                     if mode is not None:
                         self.mode_label.config(text=mode.value.upper())
+                elif kind == "add_history":
+                    _, text = msg
+                    self.add_history(text)
+                    self._render_history()
                 elif kind == "delayed_update":
                     _, delay_ms, text, status, mode = msg
                     self.root.after(delay_ms, lambda t=text, s=status, m=mode:
@@ -172,86 +403,21 @@ class Overlay:
         """Thread-safe delayed update — schedules via the main thread."""
         self._queue.put(("delayed_update", delay_ms, text, status, mode))
 
+    def push_history(self, text):
+        """Thread-safe — add a transcription to history and redraw."""
+        self._queue.put(("add_history", text))
+
 
 # ---------------------------------------------------------------------------
 # Output Handlers
 # ---------------------------------------------------------------------------
 
-def _setup_clipboard_ctypes():
-    """Declare proper 64-bit return/arg types for Win32 clipboard functions.
-
-    Without this, ctypes assumes all functions return c_int (32-bit),
-    which truncates 64-bit pointers on Windows x64 — causing access
-    violations when writing to the allocated memory.
-    """
-    kernel32 = ctypes.windll.kernel32
-    user32 = ctypes.windll.user32
-
-    kernel32.GlobalAlloc.restype = ctypes.c_void_p
-    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
-    kernel32.GlobalLock.restype = ctypes.c_void_p
-    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-    kernel32.GlobalUnlock.restype = ctypes.c_bool
-    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-
-    user32.OpenClipboard.restype = ctypes.c_bool
-    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
-    user32.CloseClipboard.restype = ctypes.c_bool
-    user32.EmptyClipboard.restype = ctypes.c_bool
-    user32.SetClipboardData.restype = ctypes.c_void_p
-    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
-
-
-_clipboard_types_set = False
-
-
 def paste_to_active_window(text: str):
-    """Copy *text* to the Windows clipboard and simulate Ctrl+V.
-
-    Uses the Win32 clipboard API via ctypes so it can be called safely
-    from any thread (unlike tkinter clipboard methods).
-    """
-    global _clipboard_types_set
-    if not _clipboard_types_set:
-        _setup_clipboard_ctypes()
-        _clipboard_types_set = True
-
+    """Copy text to clipboard and simulate Ctrl+V."""
     import keyboard as kb
-
-    CF_UNICODETEXT = 13
-    GMEM_MOVEABLE = 0x0002
-
-    kernel32 = ctypes.windll.kernel32
-    user32 = ctypes.windll.user32
-
-    # Encode as null-terminated UTF-16LE (what Windows expects)
-    data = text.encode("utf-16-le") + b"\x00\x00"
-
-    if not user32.OpenClipboard(None):
-        print("[paste] Could not open clipboard, retrying...")
-        time.sleep(0.1)
-        if not user32.OpenClipboard(None):
-            print("[paste] Failed to open clipboard")
-            return
-
-    try:
-        user32.EmptyClipboard()
-        h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
-        if not h_mem:
-            print("[paste] GlobalAlloc failed")
-            return
-        p_mem = kernel32.GlobalLock(h_mem)
-        if not p_mem:
-            print("[paste] GlobalLock failed")
-            return
-        ctypes.memmove(p_mem, data, len(data))
-        kernel32.GlobalUnlock(h_mem)
-        user32.SetClipboardData(CF_UNICODETEXT, h_mem)
-    finally:
-        user32.CloseClipboard()
-
-    time.sleep(0.05)
-    kb.send("ctrl+v")
+    if _copy_to_clipboard(text):
+        time.sleep(0.05)
+        kb.send("ctrl+v")
 
 
 def append_to_scratchpad(text: str, path: Path):
@@ -268,7 +434,9 @@ def append_to_scratchpad(text: str, path: Path):
 class VoiceType:
     """Wires together the overlay, recorder, hotkeys, and output handlers."""
 
-    QUIT_HOTKEY = "ctrl+shift+q"
+    QUIT_HOTKEY = "ctrl+alt+q"
+    COPY_HOTKEY = "ctrl+alt+c"
+    HIDE_HOTKEY = "ctrl+alt+h"
 
     def __init__(self, args: argparse.Namespace):
         self.mode = Mode(args.mode)
@@ -278,8 +446,6 @@ class VoiceType:
         self.language: str = args.language
         self.device: str = args.device
 
-        # Resolve scratchpad path relative to script dir (avoids slow
-        # \\wsl$\ UNC paths when launched from WSL).
         sp = Path(args.scratchpad_file)
         self.scratchpad_path = sp if sp.is_absolute() else SCRIPT_DIR / sp
 
@@ -314,14 +480,10 @@ class VoiceType:
             model=self.model,
             language=self.language,
             device=self.device,
-            # Realtime streaming for live display
             enable_realtime_transcription=True,
             realtime_model_type="tiny",
             realtime_processing_pause=0.2,
-            # We control stop via hotkey, so set silence duration very high
-            # to prevent auto-stop during pauses in speech.
             post_speech_silence_duration=60.0,
-            # Callbacks
             on_realtime_transcription_update=self._on_realtime_update,
             on_recording_start=self._on_recording_start,
             on_recording_stop=self._on_recording_stop,
@@ -359,19 +521,15 @@ class VoiceType:
             )
             return
 
+        # Always add to history (safety net for both modes)
+        self.overlay.push_history(text)
+
         if self.mode == Mode.INPUT:
             paste_to_active_window(text)
-            self.overlay.update(text=text, status=Status.IDLE)
-            # Reset to ready message after a delay.  Uses the overlay's
-            # thread-safe delayed update instead of root.after() directly
-            # (which is NOT safe to call from a non-main thread).
-            self.overlay.update_delayed(
-                3000,
-                text=f"Ready \u2014 {self.hotkey} to dictate",
-            )
+            self.overlay.update(status=Status.IDLE)
         else:
             append_to_scratchpad(text, self.scratchpad_path)
-            self.overlay.update(text=text, status=Status.IDLE)
+            self.overlay.update(status=Status.IDLE)
             print(f"[scratchpad] {text}")
 
     # -- hotkey handlers ----------------------------------------------------
@@ -394,11 +552,7 @@ class VoiceType:
         self.recorder.text(self._on_final_text)
 
     def _toggle_recording(self):
-        """Hotkey callback — must return FAST or Windows kills our hook.
-
-        Only touches the lock and fires off a background thread; all
-        slow work (recorder.start / stop / text) happens there.
-        """
+        """Hotkey callback — must return FAST or Windows kills our hook."""
         with self._lock:
             if self._is_processing:
                 return
@@ -418,26 +572,32 @@ class VoiceType:
         self.overlay.update(mode=self.mode)
         print(f"[voice-type] Mode switched to {self.mode.value}")
 
+    def _copy_latest(self):
+        self.overlay.copy_latest()
+
+    def _toggle_overlay(self):
+        self.overlay.toggle_visibility()
+
     def _register_hotkeys(self):
         import keyboard as kb
 
-        kb.add_hotkey(self.hotkey, self._toggle_recording, suppress=False)
-        kb.add_hotkey(self.toggle_hotkey, self._toggle_mode, suppress=False)
-        kb.add_hotkey(self.QUIT_HOTKEY, self._request_quit, suppress=False)
+        kb.add_hotkey(self.hotkey, self._toggle_recording, suppress=True)
+        kb.add_hotkey(self.toggle_hotkey, self._toggle_mode, suppress=True)
+        kb.add_hotkey(self.COPY_HOTKEY, self._copy_latest, suppress=True)
+        kb.add_hotkey(self.HIDE_HOTKEY, self._toggle_overlay, suppress=True)
+        kb.add_hotkey(self.QUIT_HOTKEY, self._request_quit, suppress=True)
 
         print(f"[voice-type] Hotkeys registered:")
         print(f"  {self.hotkey}  \u2014  toggle recording")
         print(f"  {self.toggle_hotkey}  \u2014  switch mode (input/scratchpad)")
+        print(f"  {self.COPY_HOTKEY}  \u2014  copy latest to clipboard")
+        print(f"  {self.HIDE_HOTKEY}  \u2014  hide/show overlay")
         print(f"  {self.QUIT_HOTKEY}  \u2014  quit")
 
     # -- lifecycle ----------------------------------------------------------
 
     def _request_quit(self):
-        """Called from the keyboard listener thread — schedule shutdown
-        on the main thread via the tkinter event loop."""
         self.overlay.update(text="Shutting down\u2026")
-        # root.after is the one tkinter method that IS safe from other
-        # threads on Windows (it posts to the Tcl event queue).
         self.root.after(0, self.shutdown)
 
     def run(self):
@@ -467,10 +627,6 @@ class VoiceType:
         except Exception:
             pass
 
-        # RealtimeSTT spawns daemon threads and child processes that can
-        # keep the process alive after mainloop exits.  os._exit is the
-        # only reliable way to kill everything from a Windows process
-        # launched via WSL interop (where Ctrl+C / SIGINT don't work).
         os._exit(0)
 
 
@@ -488,12 +644,12 @@ def parse_args() -> argparse.Namespace:
              "'scratchpad' appends to a file (default: input)",
     )
     p.add_argument(
-        "--hotkey", default="ctrl+shift+space",
-        help="Global hotkey to toggle recording (default: ctrl+shift+space)",
+        "--hotkey", default="ctrl+alt+space",
+        help="Global hotkey to toggle recording (default: ctrl+alt+space)",
     )
     p.add_argument(
-        "--toggle-hotkey", default="ctrl+shift+s",
-        help="Hotkey to switch between input/scratchpad mode (default: ctrl+shift+s)",
+        "--toggle-hotkey", default="ctrl+alt+s",
+        help="Hotkey to switch between input/scratchpad mode (default: ctrl+alt+s)",
     )
     p.add_argument(
         "--model", default="base",
