@@ -1,10 +1,12 @@
 # HotMic configuration
 # CLI arguments override these values.
 
-model = "base"
+model = "medium"
+realtime-model = "small"
 language = "en"
 hotkey = "ctrl+alt+space"
 auto-paste = true
 max-history = 50
 load-history = false
-device = "cpu"
+device = "cuda"
+debug = false

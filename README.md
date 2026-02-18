@@ -31,7 +31,6 @@ The installer auto-detects Python, installs dependencies, and sets up:
   winget install Python.Python.3.12
   ```
 - **WSL** (Ubuntu or similar) — only needed if using the WSL launcher
-- **Administrator privileges** — the `keyboard` library requires admin to register global hotkeys. Run your terminal as administrator, or right-click the Start Menu shortcut and choose "Run as administrator".
 
 ## Usage
 
@@ -39,7 +38,9 @@ The installer auto-detects Python, installs dependencies, and sets up:
 hotmic                              # default: auto-paste on, fresh overlay
 hotmic --no-auto-paste              # start with auto-paste off
 hotmic --load-history               # load previous session's history
-hotmic --model small --device cuda  # larger model on GPU
+hotmic --model medium --device cuda # larger model on GPU
+hotmic --stop                       # kill a running instance
+hotmic --build                      # snapshot source to prod directory
 ```
 
 ### Configuration
@@ -47,16 +48,31 @@ hotmic --model small --device cuda  # larger model on GPU
 Edit `config.toml` in the project directory to change defaults:
 
 ```toml
-model = "base"
+model = "medium"            # final transcription model
+realtime-model = "small"    # live preview model (runs every ~200ms)
 language = "en"
 hotkey = "ctrl+alt+space"
 auto-paste = true
 max-history = 50
 load-history = false
-device = "cpu"
+device = "cuda"             # "cpu" or "cuda"
 ```
 
 CLI arguments override config file values.
+
+#### Whisper Models
+
+| Model | Parameters | VRAM (GPU) | Notes |
+|-------|-----------|------------|-------|
+| tiny | 39M | ~1 GB | Fast, rough accuracy |
+| base | 74M | ~1 GB | Good default for CPU |
+| small | 244M | ~2 GB | Good balance |
+| medium | 769M | ~5 GB | Very good accuracy |
+| large-v3 | 1.5B | ~10 GB | Best accuracy |
+
+Two models run simultaneously: the **realtime model** provides a live preview while you speak (runs inference every ~200ms), and the **final model** does a single accurate pass when you stop recording.
+
+On CPU, keep the realtime model at `tiny` or `base`. On GPU, you can use `small` or even `medium` for realtime without lag.
 
 ### Hotkeys
 
@@ -68,7 +84,7 @@ CLI arguments override config file values.
 | `Ctrl+Alt+H` | Hide/show overlay |
 | `Ctrl+Alt+Q` | Quit |
 
-All hotkeys are suppressed — they won't pass through to other applications. Hover over the `?` in the overlay to see hotkeys at any time.
+Hotkeys use Win32 `RegisterHotKey` which is immune to Windows killing hooks when elevated processes (like Task Manager) have focus. Hover over the `?` in the overlay to see hotkeys at any time.
 
 ### Auto-Paste
 
@@ -103,16 +119,79 @@ A dark bar at the bottom of the screen:
 - `Ctrl+Alt+H` to hide (shows a tiny dot in the top-right corner so you know it's still running)
 - Does not steal focus from your active application
 
+## Process Management
+
+HotMic writes a PID file to `%LOCALAPPDATA%\HotMic\hotmic.pid` on startup. This enables:
+
+```bash
+hotmic --stop         # kill a running instance without hunting through Task Manager
+```
+
+On startup, HotMic warns if a previous instance is still running.
+
+### Prod/Dev Split
+
+To avoid breaking your daily driver while editing source:
+
+```bash
+hotmic --build        # snapshot voice_type.py + config.toml to %LOCALAPPDATA%\HotMic\prod\
+hotmic --install      # Start Menu shortcut points at prod copy (if it exists)
+```
+
+- **Dev** (`./hotmic` from terminal) always runs from the source tree
+- **Prod** (Start Menu) runs from the frozen snapshot in `%LOCALAPPDATA%\HotMic\prod\`
+- Update prod: `hotmic --build && hotmic --install`
+
 ## How It Works
 
-1. On startup, loads two Whisper models via RealtimeSTT: `tiny` for fast live partial results, `base` (configurable) for accurate final transcription.
+1. On startup, loads two Whisper models via RealtimeSTT: a smaller model for fast live preview, and a larger model (both configurable) for accurate final transcription.
 2. Press `Ctrl+Alt+Space` to start recording. RealtimeSTT transcribes in rolling ~200ms chunks and the overlay updates live.
 3. Press again to stop. A final transcription pass runs with the larger model.
 4. The final text is saved to `history.txt`, shown in the overlay, and optionally auto-pasted into the active window.
 
+## Troubleshooting
+
+### GPU not being used (CUDA)
+
+If you set `device = "cuda"` but see this warning on startup:
+
+```
+The compute type inferred from the saved model is float16, but the target device
+or backend do not support efficient float16 computation.
+```
+
+Your PyTorch installation likely doesn't have CUDA support. Check:
+
+```bash
+py -3 -c "import torch; print(torch.__version__, 'CUDA:', torch.cuda.is_available())"
+```
+
+If it shows `+cpu` or `CUDA: False`, reinstall PyTorch with CUDA:
+
+```bash
+py -3 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+```
+
+Verify with `nvidia-smi` while HotMic is running — you should see `python.exe` processes in the GPU process list.
+
+### Hotkeys not working
+
+HotMic uses Win32 `RegisterHotKey` which requires the hotkey combination to not be registered by another application. If a hotkey fails to register, you'll see an error in the console. Try changing the hotkey in `config.toml`.
+
+### Killing a stuck instance
+
+If HotMic is unresponsive:
+
+```bash
+hotmic --stop                 # uses PID file
+# or manually:
+taskkill /IM python.exe /F    # kills ALL Python processes — use with care
+```
+
 ## Uninstall
 
 ```bash
+hotmic --stop             # stop running instance first
 hotmic --uninstall        # WSL
 hotmic.bat --uninstall    # Windows
 ```

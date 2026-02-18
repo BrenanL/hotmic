@@ -23,6 +23,13 @@ from enum import Enum, auto
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DEBUG = False
+
+
+def _dbg(msg: str):
+    """Print a debug message if DEBUG is enabled."""
+    if DEBUG:
+        print(f"[debug] {msg}")
 HISTORY_LINE_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] (.+)$")
 
 # PID file for --stop support (Windows only)
@@ -651,12 +658,44 @@ class Overlay:
 # Output Handlers
 # ---------------------------------------------------------------------------
 
+def _send_ctrl_v():
+    """Simulate Ctrl+V keypress via Win32 keybd_event.
+
+    Releases all modifier keys first to avoid ghost modifiers from
+    hotkey combos that haven't fully released yet (e.g., Alt still held
+    from Ctrl+Alt+Space turns our Ctrl+V into Ctrl+Alt+V).
+    """
+    KEYEVENTF_KEYUP = 0x0002
+    VK_V = 0x56
+    user32 = ctypes.windll.user32
+    # Release any held modifiers
+    for vk in (0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C):
+        #       LShift RShift LCtrl  RCtrl  LAlt   RAlt   LWin   RWin
+        user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+    time.sleep(0.01)
+    # Send clean Ctrl+V
+    user32.keybd_event(0xA2, 0, 0, 0)           # LCtrl down
+    user32.keybd_event(VK_V, 0, 0, 0)           # V down
+    user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)   # V up
+    user32.keybd_event(0xA2, 0, KEYEVENTF_KEYUP, 0)   # LCtrl up
+
+
 def paste_to_active_window(text: str):
     """Copy text to clipboard and simulate Ctrl+V."""
-    import keyboard as kb
-    if _copy_to_clipboard(text):
+    if DEBUG:
+        user32 = ctypes.windll.user32
+        fg = user32.GetForegroundWindow()
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(fg, buf, 256)
+        _dbg(f"paste: fg_hwnd={fg} title={buf.value!r}")
+
+    ok = _copy_to_clipboard(text)
+    if ok:
         time.sleep(0.05)
-        kb.send("ctrl+v")
+        _send_ctrl_v()
+        _dbg("paste: sent Ctrl+V")
+    else:
+        _dbg("paste: clipboard copy FAILED")
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +714,7 @@ class HotMic:
         self.auto_paste: bool = args.auto_paste
         self.hotkey: str = args.hotkey
         self.model: str = args.model
+        self.realtime_model: str = args.realtime_model
         self.language: str = args.language
         self.device: str = args.device
 
@@ -706,22 +746,41 @@ class HotMic:
         self._register_hotkeys()
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
 
-        # Warm up keyboard module so first paste isn't delayed
-        import keyboard  # noqa: F401
 
     # -- recorder setup -----------------------------------------------------
+
+    @staticmethod
+    def _check_model_cached(model_name: str) -> bool:
+        """Check if a faster-whisper model is already in the huggingface cache."""
+        try:
+            from huggingface_hub.constants import HF_HUB_CACHE
+            cache_dir = Path(HF_HUB_CACHE) / f"models--Systran--faster-whisper-{model_name}"
+            return cache_dir.is_dir()
+        except Exception:
+            return True  # assume cached if we can't check
 
     def _init_recorder(self):
         from RealtimeSTT import AudioToTextRecorder
 
-        self.overlay.update(text="Loading Whisper models\u2026")
+        need_download = [m for m in (self.model, self.realtime_model)
+                         if not self._check_model_cached(m)]
+        if need_download:
+            models = " + ".join(need_download)
+            self.overlay.update(
+                text=f"Downloading Whisper model: {models} (first run)\u2026",
+            )
+            print(f"[hotmic] Downloading: {models}")
+        else:
+            self.overlay.update(
+                text=f"Loading Whisper models ({self.model} + {self.realtime_model})\u2026",
+            )
 
         self.recorder = AudioToTextRecorder(
             model=self.model,
             language=self.language,
             device=self.device,
             enable_realtime_transcription=True,
-            realtime_model_type="tiny",
+            realtime_model_type=self.realtime_model,
             realtime_processing_pause=0.2,
             post_speech_silence_duration=60.0,
             on_realtime_transcription_update=self._on_realtime_update,
@@ -734,7 +793,8 @@ class HotMic:
             text=f"Ready \u2014 {self.hotkey} to dictate",
             status=Status.IDLE,
         )
-        print(f"[hotmic] Recorder ready  model={self.model}  device={self.device}")
+        print(f"[hotmic] Recorder ready  model={self.model}  "
+              f"realtime={self.realtime_model}  device={self.device}")
 
     # -- RealtimeSTT callbacks ----------------------------------------------
 
@@ -750,6 +810,7 @@ class HotMic:
 
     def _on_final_text(self, text: str):
         text = text.strip()
+        _dbg(f"final_text: {text!r:.80}")
         with self._lock:
             self._is_processing = False
 
@@ -766,7 +827,8 @@ class HotMic:
         self.overlay.update(status=Status.IDLE)
 
         if self.auto_paste:
-            paste_to_active_window(text)
+            # Queue paste on the main thread after Tk processes overlay updates
+            self.root.after(100, paste_to_active_window, text)
 
     # -- hotkey handlers ----------------------------------------------------
 
@@ -974,8 +1036,17 @@ def parse_args() -> argparse.Namespace:
         help="Start with auto-paste disabled",
     )
     p.add_argument(
+        "--realtime-model", default=cfg.get("realtime-model", "tiny"),
+        help="Whisper model for live preview (runs every ~200ms while speaking)",
+    )
+    p.add_argument(
         "--device", default=cfg.get("device", "cpu"), choices=["cpu", "cuda"],
         help="Inference device",
+    )
+    p.add_argument(
+        "--debug", action="store_true",
+        default=cfg.get("debug", False),
+        help="Enable debug logging",
     )
     args = p.parse_args()
     args.auto_paste = not args.no_auto_paste
@@ -996,6 +1067,9 @@ def main():
     _write_pid_file()
 
     args = parse_args()
+    global DEBUG
+    DEBUG = args.debug
+
     app = HotMic(args)
     try:
         app.run()
