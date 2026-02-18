@@ -1,0 +1,10 @@
+# HotMic configuration
+# CLI arguments override these values.
+
+model = "base"
+language = "en"
+hotkey = "ctrl+alt+space"
+auto-paste = true
+max-history = 50
+load-history = false
+device = "cpu"

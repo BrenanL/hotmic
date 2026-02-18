@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 SCRIPT_PY="$SCRIPT_DIR/voice_type.py"
 
 # package-name:import-name (when they differ)
-DEPS=(RealtimeSTT keyboard python-dotenv:dotenv requests)
+DEPS=(RealtimeSTT keyboard requests)
 
 # ── Windows Python detection ──────────────────────────────────────────────
 

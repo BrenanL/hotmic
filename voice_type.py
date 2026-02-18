@@ -465,14 +465,10 @@ class Overlay:
 
             # Create per-entry tag spanning timestamp + text
             self.text_area.tag_add(tag_name, start, end)
-            self.text_area.tag_configure(tag_name, )  # no extra style
-            # Bind click-to-copy; use default arg to capture i
             self.text_area.tag_bind(
                 tag_name, "<Button-1>",
                 lambda e, idx=i: self._copy_entry(idx),
             )
-            self.text_area.tag_configure(tag_name, )  # cursor on hover
-            # Can't set cursor per-tag in Text; the widget cursor handles it
 
         self.text_area.see("end")
         self.text_area.config(state="disabled")
@@ -550,7 +546,7 @@ def paste_to_active_window(text: str):
 # Main Application
 # ---------------------------------------------------------------------------
 
-class VoiceType:
+class HotMic:
     """Wires together the overlay, recorder, hotkeys, and output handlers."""
 
     QUIT_HOTKEY = "ctrl+alt+q"
@@ -743,46 +739,77 @@ class VoiceType:
 # CLI
 # ---------------------------------------------------------------------------
 
+def _load_config() -> dict:
+    """Load config.toml from the script directory, returning a flat dict."""
+    config_path = SCRIPT_DIR / "config.toml"
+    if not config_path.exists():
+        return {}
+    config = {}
+    with open(config_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"')
+            # Parse booleans and integers
+            if val.lower() == "true":
+                val = True
+            elif val.lower() == "false":
+                val = False
+            else:
+                try:
+                    val = int(val)
+                except ValueError:
+                    pass
+            config[key] = val
+    return config
+
+
 def parse_args() -> argparse.Namespace:
+    cfg = _load_config()
+
     p = argparse.ArgumentParser(
         description="HotMic \u2014 Whisper-powered voice dictation",
     )
     p.add_argument(
-        "--hotkey", default="ctrl+alt+space",
-        help="Global hotkey to toggle recording (default: ctrl+alt+space)",
+        "--hotkey", default=cfg.get("hotkey", "ctrl+alt+space"),
+        help="Global hotkey to toggle recording",
     )
     p.add_argument(
-        "--model", default="base",
-        help="Whisper model for final transcription (default: base)",
+        "--model", default=cfg.get("model", "base"),
+        help="Whisper model for final transcription",
     )
     p.add_argument(
-        "--language", default="en",
-        help="Transcription language (default: en)",
+        "--language", default=cfg.get("language", "en"),
+        help="Transcription language",
     )
     p.add_argument(
-        "--history-file", default="history.txt",
-        help="Path for history log (default: history.txt)",
+        "--history-file", default=cfg.get("history-file", "history.txt"),
+        help="Path for history log",
     )
     p.add_argument(
-        "--max-history", type=int, default=50,
-        help="Max history entries to display in overlay (default: 50)",
+        "--max-history", type=int, default=cfg.get("max-history", 50),
+        help="Max history entries to display in overlay",
     )
     p.add_argument(
-        "--load-history", action="store_true", default=False,
+        "--load-history", action="store_true",
+        default=cfg.get("load-history", False),
         help="Load previous session's history into overlay on launch",
     )
     p.add_argument(
-        "--no-auto-paste", action="store_true", default=False,
+        "--no-auto-paste", action="store_true",
+        default=not cfg.get("auto-paste", True),
         help="Start with auto-paste disabled",
     )
     p.add_argument(
-        "--device", default="cpu", choices=["cpu", "cuda"],
-        help="Inference device (default: cpu)",
+        "--device", default=cfg.get("device", "cpu"), choices=["cpu", "cuda"],
+        help="Inference device",
     )
-    return _post_process_args(p.parse_args())
-
-
-def _post_process_args(args: argparse.Namespace) -> argparse.Namespace:
+    args = p.parse_args()
     args.auto_paste = not args.no_auto_paste
     return args
 
@@ -797,11 +824,8 @@ def main():
     # system32, which causes permission errors for log files and model caches.
     os.chdir(SCRIPT_DIR)
 
-    from dotenv import load_dotenv
-    load_dotenv(SCRIPT_DIR / ".env")
-
     args = parse_args()
-    app = VoiceType(args)
+    app = HotMic(args)
     try:
         app.run()
     except KeyboardInterrupt:

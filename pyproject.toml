@@ -6,9 +6,8 @@ requires-python = ">=3.10"
 dependencies = [
     "RealtimeSTT",
     "keyboard",
-    "python-dotenv",
     "requests",
 ]
 
 [project.scripts]
-voice-type = "voice_type:main"
+hotmic = "voice_type:main"

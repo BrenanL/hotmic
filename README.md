@@ -4,23 +4,34 @@ Whisper-powered voice dictation for Windows. Push a hotkey, speak, see live tran
 
 ## Quick Start
 
+### Windows (native)
+
+```
+git clone https://github.com/BrenanL/hotmic.git
+cd hotmic
+hotmic.bat --install
+```
+
+### WSL
+
 ```bash
-git clone <repo-url>
-cd voice-type
+git clone https://github.com/BrenanL/hotmic.git
+cd hotmic
 ./hotmic --install
 ```
 
-That's it. The installer auto-detects Windows Python, installs dependencies, and sets up:
-- **Terminal:** `hotmic` from any directory
-- **Win+S:** type "HotMic" and hit Enter
+The installer auto-detects Python, installs dependencies, and sets up:
+- **Win+S:** type "HotMic" and hit Enter (no terminal needed)
+- **Terminal:** `hotmic` (WSL) or `hotmic.bat` (Windows) from any directory
 
 ### Prerequisites
 
-- **WSL** (Ubuntu or similar)
 - **Windows Python 3.10+** — if not installed:
-  ```bash
-  powershell.exe -Command "winget install Python.Python.3.12"
   ```
+  winget install Python.Python.3.12
+  ```
+- **WSL** (Ubuntu or similar) — only needed if using the WSL launcher
+- **Administrator privileges** — the `keyboard` library requires admin to register global hotkeys. Run your terminal as administrator, or right-click the Start Menu shortcut and choose "Run as administrator".
 
 ## Usage
 
@@ -30,6 +41,22 @@ hotmic --no-auto-paste              # start with auto-paste off
 hotmic --load-history               # load previous session's history
 hotmic --model small --device cuda  # larger model on GPU
 ```
+
+### Configuration
+
+Edit `config.toml` in the project directory to change defaults:
+
+```toml
+model = "base"
+language = "en"
+hotkey = "ctrl+alt+space"
+auto-paste = true
+max-history = 50
+load-history = false
+device = "cpu"
+```
+
+CLI arguments override config file values.
 
 ### Hotkeys
 
@@ -41,7 +68,7 @@ hotmic --model small --device cuda  # larger model on GPU
 | `Ctrl+Alt+H` | Hide/show overlay |
 | `Ctrl+Alt+Q` | Quit |
 
-All hotkeys are suppressed — they won't pass through to other applications.
+All hotkeys are suppressed — they won't pass through to other applications. Hover over the `?` in the overlay to see hotkeys at any time.
 
 ### Auto-Paste
 
@@ -55,7 +82,7 @@ Toggle with `Ctrl+Alt+P` at any time, even mid-session.
 
 Every transcription is always saved to `history.txt` with a full timestamp, regardless of auto-paste setting. The file grows indefinitely and is never modified by the tool — it's your permanent log.
 
-The overlay shows the most recent entries (up to `--max-history`, default 50). You can:
+The overlay shows the most recent entries (up to `max-history`, default 50). You can:
 
 - **Click any entry** to copy just that one to the clipboard (entry flashes to confirm)
 - **[Copy All]** button or `Ctrl+Alt+C` to copy all visible entries, newline-separated
@@ -70,23 +97,11 @@ A dark bar at the bottom of the screen:
 - Status dot: red = recording, yellow = processing, gray = idle
 - Auto-paste indicator (green ON / red OFF)
 - [Copy All] and [Clear] buttons
+- `?` tooltip showing all hotkeys
 - Click any history entry to copy it
 - Draggable — click and drag to reposition
 - `Ctrl+Alt+H` to hide (shows a tiny dot in the top-right corner so you know it's still running)
 - Does not steal focus from your active application
-
-## CLI Options
-
-```
---hotkey TEXT            Recording hotkey (default: ctrl+alt+space)
---model TEXT             Whisper model: tiny/base/small/medium (default: base)
---language TEXT           Language code (default: en)
---history-file PATH      History log path (default: history.txt)
---max-history N          Max entries shown in overlay (default: 50)
---load-history           Load previous session's history on launch
---no-auto-paste          Start with auto-paste disabled
---device {cpu,cuda}      Inference device (default: cpu)
-```
 
 ## How It Works
 
@@ -98,22 +113,29 @@ A dark bar at the bottom of the screen:
 ## Uninstall
 
 ```bash
-hotmic --uninstall
+hotmic --uninstall        # WSL
+hotmic.bat --uninstall    # Windows
 ```
 
-Removes the terminal symlink and Start Menu shortcut. The project folder is left untouched.
+Removes the Start Menu shortcut and app data. The project folder is left untouched.
 
 ## File Structure
 
 ```
-voice-type/
-├── hotmic             # Launcher script (bash)
+hotmic/
+├── hotmic             # Launcher script (WSL/bash)
+├── hotmic.bat         # Launcher script (Windows-native)
 ├── voice_type.py      # Main script
-├── pyproject.toml     # Project config / dependencies
-├── .env               # API key (gitignored)
+├── config.toml        # User configuration
+├── hotmic.ico         # App icon
+├── pyproject.toml     # Project metadata / dependencies
+├── LICENSE            # MIT license
 ├── .gitignore
-├── history.txt        # Persistent transcription log (gitignored)
-├── DESIGN.md          # Architecture overview
-├── TASKS.md           # Implementation task breakdown
-└── README.md          # This file
+├── tools/
+│   └── gen_icon.py    # Icon generator (requires Pillow)
+└── README.md
 ```
+
+## License
+
+MIT

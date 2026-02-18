@@ -1,4 +1,7 @@
-"""Generate HotMic app icon — wireframe mic with lightning bolt and red hot dot."""
+"""Generate HotMic app icon — wireframe mic with red hot dot.
+
+Requires Pillow: pip install Pillow
+"""
 
 from PIL import Image, ImageDraw
 import math
