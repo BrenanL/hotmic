@@ -9,6 +9,7 @@ Must be run with Windows Python (python.exe), not WSL Python.
 
 import argparse
 import ctypes
+import ctypes.wintypes
 import datetime
 import os
 import platform
@@ -23,6 +24,13 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HISTORY_LINE_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] (.+)$")
+
+# PID file for --stop support (Windows only)
+PID_FILE = (
+    Path(os.environ.get("LOCALAPPDATA", "")) / "HotMic" / "hotmic.pid"
+    if os.environ.get("LOCALAPPDATA")
+    else None
+)
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +57,115 @@ def _apply_no_activate(hwnd):
     ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
     SWP = 0x0010 | 0x0002 | 0x0001 | 0x0020  # NOACTIVATE|NOMOVE|NOSIZE|FRAMECHANGED
     ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP)
+
+
+class Win32Hotkeys:
+    """Register global hotkeys via Win32 RegisterHotKey API.
+
+    Unlike low-level keyboard hooks, RegisterHotKey is message-based and
+    immune to Windows killing hooks when elevated processes gain focus.
+    """
+
+    # Modifier flags for RegisterHotKey
+    MOD_ALT = 0x0001
+    MOD_CONTROL = 0x0002
+    MOD_SHIFT = 0x0004
+    MOD_WIN = 0x0008
+    MOD_NOREPEAT = 0x4000
+
+    # Common virtual key codes
+    VK_MAP = {
+        "space": 0x20, "enter": 0x0D, "return": 0x0D, "tab": 0x09,
+        "escape": 0x1B, "esc": 0x1B, "backspace": 0x08,
+        "delete": 0x2E, "insert": 0x2D,
+        "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+        "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+        "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73,
+        "f5": 0x74, "f6": 0x75, "f7": 0x76, "f8": 0x77,
+        "f9": 0x78, "f10": 0x79, "f11": 0x7A, "f12": 0x7B,
+    }
+
+    MOD_MAP = {
+        "ctrl": MOD_CONTROL, "control": MOD_CONTROL,
+        "alt": MOD_ALT, "shift": MOD_SHIFT,
+        "win": MOD_WIN, "windows": MOD_WIN,
+    }
+
+    WM_HOTKEY = 0x0312
+
+    def __init__(self, root: tk.Tk):
+        self._root = root
+        self._pending: list[tuple[int, int, int, callable]] = []  # (id, mods, vk, cb)
+        self._next_id = 1
+        self._thread_id = None
+        self._ready = threading.Event()
+
+    @classmethod
+    def parse_hotkey(cls, hotkey_str: str) -> tuple[int, int]:
+        """Parse 'ctrl+alt+space' into (modifier_flags, vk_code)."""
+        parts = [p.strip().lower() for p in hotkey_str.split("+")]
+        mods = cls.MOD_NOREPEAT
+        vk = 0
+        for part in parts:
+            if part in cls.MOD_MAP:
+                mods |= cls.MOD_MAP[part]
+            elif part in cls.VK_MAP:
+                vk = cls.VK_MAP[part]
+            elif len(part) == 1 and part.isalnum():
+                vk = ord(part.upper())
+            else:
+                raise ValueError(f"Unknown key in hotkey: {part!r}")
+        if vk == 0:
+            raise ValueError(f"No key found in hotkey: {hotkey_str!r}")
+        return mods, vk
+
+    def register(self, hotkey_str: str, callback: callable) -> int:
+        """Queue a hotkey for registration. Actual Win32 call happens on the
+        dedicated thread when start() is called."""
+        mods, vk = self.parse_hotkey(hotkey_str)
+        hk_id = self._next_id
+        self._next_id += 1
+        self._pending.append((hk_id, mods, vk, callback))
+        return hk_id
+
+    def start(self):
+        """Spawn the hotkey thread — registers hotkeys and listens."""
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+        self._ready.wait()
+
+    def _run(self):
+        """Dedicated thread: register hotkeys, run blocking message loop."""
+        user32 = ctypes.windll.user32
+        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+        callbacks = {}
+        for hk_id, mods, vk, cb in self._pending:
+            if not user32.RegisterHotKey(None, hk_id, mods, vk):
+                print(f"[hotkeys] RegisterHotKey failed for id {hk_id} "
+                      f"(error {ctypes.GetLastError()})")
+            else:
+                callbacks[hk_id] = cb
+        self._pending.clear()
+        self._ready.set()
+
+        msg = ctypes.wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == self.WM_HOTKEY:
+                cb = callbacks.get(msg.wParam)
+                if cb:
+                    self._root.after(0, cb)
+
+        # WM_QUIT received — clean up
+        for hk_id in callbacks:
+            user32.UnregisterHotKey(None, hk_id)
+
+    def unregister_all(self):
+        """Post WM_QUIT to the hotkey thread to shut it down."""
+        if self._thread_id is not None:
+            ctypes.windll.user32.PostThreadMessageW(
+                self._thread_id, 0x0012, 0, 0,  # WM_QUIT
+            )
+            self._thread_id = None
 
 
 def _copy_to_clipboard(text: str) -> bool:
@@ -589,6 +706,9 @@ class HotMic:
         self._register_hotkeys()
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
 
+        # Warm up keyboard module so first paste isn't delayed
+        import keyboard  # noqa: F401
+
     # -- recorder setup -----------------------------------------------------
 
     def _init_recorder(self):
@@ -689,20 +809,21 @@ class HotMic:
         self.overlay.toggle_visibility()
 
     def _register_hotkeys(self):
-        import keyboard as kb
+        self._hotkeys = Win32Hotkeys(self.root)
+        hotkey_bindings = [
+            (self.hotkey, self._toggle_recording, "toggle recording"),
+            (self.PASTE_TOGGLE_HOTKEY, self._toggle_auto_paste, "toggle auto-paste"),
+            (self.COPY_ALL_HOTKEY, self._copy_all, "copy all history to clipboard"),
+            (self.HIDE_HOTKEY, self._toggle_overlay, "hide/show overlay"),
+            (self.QUIT_HOTKEY, self._request_quit, "quit"),
+        ]
 
-        kb.add_hotkey(self.hotkey, self._toggle_recording, suppress=True)
-        kb.add_hotkey(self.PASTE_TOGGLE_HOTKEY, self._toggle_auto_paste, suppress=True)
-        kb.add_hotkey(self.COPY_ALL_HOTKEY, self._copy_all, suppress=True)
-        kb.add_hotkey(self.HIDE_HOTKEY, self._toggle_overlay, suppress=True)
-        kb.add_hotkey(self.QUIT_HOTKEY, self._request_quit, suppress=True)
+        print("[hotmic] Hotkeys (Win32 RegisterHotKey):")
+        for hk_str, callback, desc in hotkey_bindings:
+            self._hotkeys.register(hk_str, callback)
+            print(f"  {hk_str}  \u2014  {desc}")
 
-        print("[hotmic] Hotkeys:")
-        print(f"  {self.hotkey}  \u2014  toggle recording")
-        print(f"  {self.PASTE_TOGGLE_HOTKEY}  \u2014  toggle auto-paste")
-        print(f"  {self.COPY_ALL_HOTKEY}  \u2014  copy all history to clipboard")
-        print(f"  {self.HIDE_HOTKEY}  \u2014  hide/show overlay")
-        print(f"  {self.QUIT_HOTKEY}  \u2014  quit")
+        self._hotkeys.start()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -716,9 +837,8 @@ class HotMic:
 
     def shutdown(self):
         print("[hotmic] Shutting down\u2026")
-        import keyboard as kb
         try:
-            kb.unhook_all()
+            self._hotkeys.unregister_all()
         except Exception:
             pass
         if self.recorder:
@@ -728,11 +848,59 @@ class HotMic:
                 self.recorder.shutdown()
             except Exception:
                 pass
+        _remove_pid_file()
         try:
             self.root.destroy()
         except Exception:
             pass
         os._exit(0)
+
+
+# ---------------------------------------------------------------------------
+# PID file helpers
+# ---------------------------------------------------------------------------
+
+def _write_pid_file():
+    """Write the current process PID to the PID file."""
+    if PID_FILE is None:
+        return
+    try:
+        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError as e:
+        print(f"[hotmic] Warning: could not write PID file: {e}")
+
+
+def _remove_pid_file():
+    """Remove the PID file on clean shutdown."""
+    if PID_FILE is None:
+        return
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _check_stale_pid():
+    """Check if a previous instance is still running. Warn if so."""
+    if PID_FILE is None or not PID_FILE.exists():
+        return
+    try:
+        old_pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        return
+    # On Windows, check if the old PID is still alive
+    try:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, old_pid,
+        )
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            print(f"[hotmic] Warning: previous instance may still be running (PID {old_pid})")
+            print(f"[hotmic] Use './hotmic --stop' to kill it first.")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -823,6 +991,9 @@ def main():
     # Ensure CWD is the project directory — Start Menu shortcuts default to
     # system32, which causes permission errors for log files and model caches.
     os.chdir(SCRIPT_DIR)
+
+    _check_stale_pid()
+    _write_pid_file()
 
     args = parse_args()
     app = HotMic(args)

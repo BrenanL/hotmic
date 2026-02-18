@@ -9,6 +9,8 @@
 #   ./hotmic --no-auto-paste     # launch with args
 #   ./hotmic --install           # one-time: add to PATH + Start Menu
 #   ./hotmic --uninstall         # remove PATH symlink + Start Menu entry
+#   ./hotmic --build             # snapshot source to prod directory
+#   ./hotmic --stop              # kill a running instance via PID file
 
 set -euo pipefail
 
@@ -96,8 +98,43 @@ else
     ICO_DIR="/mnt/c/Users/$(whoami)/AppData/Local/HotMic"
 fi
 ICO_PATH="$ICO_DIR/hotmic.ico"
+PROD_DIR="$ICO_DIR/prod"
+PID_FILE="$ICO_DIR/hotmic.pid"
 # Also track old .bat for cleanup during uninstall
 OLD_BAT_PATH="$START_MENU/Voice Type.bat"
+
+do_build() {
+    echo "Building prod snapshot..."
+    mkdir -p "$PROD_DIR"
+    cp "$SCRIPT_DIR/voice_type.py" "$PROD_DIR/voice_type.py"
+    cp "$SCRIPT_DIR/config.toml" "$PROD_DIR/config.toml" 2>/dev/null || true
+    echo "  Copied voice_type.py → $PROD_DIR/"
+    echo "  Copied config.toml   → $PROD_DIR/"
+    echo ""
+    echo "Done! Run './hotmic --install' to update the Start Menu shortcut."
+}
+
+do_stop() {
+    if [[ ! -f "$PID_FILE" ]]; then
+        echo "No PID file found — HotMic may not be running."
+        exit 0
+    fi
+    local pid
+    pid="$(cat "$PID_FILE" | tr -d '\r\n ')"
+    if [[ -z "$pid" ]]; then
+        echo "PID file is empty. Cleaning up."
+        rm -f "$PID_FILE"
+        exit 0
+    fi
+    echo "Stopping HotMic (PID $pid)..."
+    if taskkill.exe /PID "$pid" /F &>/dev/null; then
+        echo "  Killed process $pid"
+    else
+        echo "  Process $pid not found (already stopped?)"
+    fi
+    rm -f "$PID_FILE"
+    echo "Done."
+}
 
 do_install() {
     local py=("$@")
@@ -116,12 +153,23 @@ do_install() {
     echo "  Python dependencies: OK"
 
     # 3. Create VBS launcher + Windows Start Menu shortcut (.lnk)
+    #    If a prod snapshot exists, point at that instead of source tree.
+    local launch_py="$SCRIPT_PY"
+    local launch_dir="$SCRIPT_DIR"
+    if [[ -f "$PROD_DIR/voice_type.py" ]]; then
+        launch_py="$PROD_DIR/voice_type.py"
+        launch_dir="$PROD_DIR"
+        echo "  Using prod snapshot: $PROD_DIR/"
+    else
+        echo "  No prod snapshot — using source tree"
+    fi
+
     local win_py
     win_py=$("${py[@]}" -c "import sys; print(sys.executable)" | tr -d '\r')
     local win_script
-    win_script="$(wslpath -w "$SCRIPT_PY")"
+    win_script="$(wslpath -w "$launch_py")"
     local win_dir
-    win_dir="$(wslpath -w "$SCRIPT_DIR")"
+    win_dir="$(wslpath -w "$launch_dir")"
 
     # Copy icon to Windows-native path so Shell can display it
     mkdir -p "$ICO_DIR"
@@ -171,8 +219,15 @@ do_uninstall() {
     fi
 
     if [[ -d "$ICO_DIR" ]]; then
-        rm -rf "$ICO_DIR"
-        echo "  Removed icon: $ICO_DIR"
+        local win_dir
+        win_dir="$(wslpath -w "$ICO_DIR" 2>/dev/null)" || true
+        if [[ -n "$win_dir" ]] && cmd.exe /C "rmdir /s /q \"$win_dir\"" &>/dev/null; then
+            echo "  Removed app data: $ICO_DIR"
+        elif rm -rf "$ICO_DIR" 2>/dev/null; then
+            echo "  Removed app data: $ICO_DIR"
+        else
+            echo "  Warning: could not remove $ICO_DIR (delete manually)"
+        fi
     fi
 
     # Clean up old .bat if it exists
@@ -204,6 +259,14 @@ case "${1:-}" in
         ;;
     --uninstall)
         do_uninstall
+        exit 0
+        ;;
+    --build)
+        do_build
+        exit 0
+        ;;
+    --stop)
+        do_stop
         exit 0
         ;;
 esac
