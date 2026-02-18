@@ -1,4 +1,4 @@
-"""Voice Type — Whisper-powered voice dictation for Windows.
+"""HotMic — Whisper-powered voice dictation for Windows.
 
 A lightweight overlay that captures speech via hotkey, shows live
 transcription, and optionally auto-pastes into the active window.
@@ -227,7 +227,7 @@ class Overlay:
     # -- window setup -------------------------------------------------------
 
     def _setup_window(self):
-        self.root.title("Voice Type")
+        self.root.title("HotMic")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.88)
@@ -264,6 +264,15 @@ class Overlay:
         self.paste_label.pack(side="left", padx=(10, 0))
 
         # Right-side buttons (packed right-to-left)
+        self._help_btn = tk.Label(
+            top, text="?", fg=self.FG_DIM, bg=self.BG,
+            font=("Segoe UI", 9, "bold"), cursor="hand2",
+        )
+        self._help_btn.pack(side="right", padx=(8, 0))
+        self._help_btn.bind("<Enter>", self._show_hotkey_tooltip)
+        self._help_btn.bind("<Leave>", self._hide_hotkey_tooltip)
+        self._tooltip = None
+
         for text, cmd in [
             ("[Clear]", self._on_clear_click),
             ("[Copy All]", self._on_copy_all_click),
@@ -317,6 +326,42 @@ class Overlay:
             _apply_no_activate(hwnd)
         except Exception as exc:
             print(f"[overlay] Could not set WS_EX_NOACTIVATE: {exc}")
+
+    # -- hotkey tooltip -----------------------------------------------------
+
+    def _show_hotkey_tooltip(self, event):
+        if self._tooltip:
+            return
+        x = self._help_btn.winfo_rootx() - 200
+        y = self._help_btn.winfo_rooty() - 110
+        self._tooltip = tw = tk.Toplevel(self.root)
+        tw.overrideredirect(True)
+        tw.attributes("-topmost", True)
+        tw.configure(bg="#2a2a3e")
+        tw.geometry(f"+{x}+{y}")
+        lines = [
+            ("Ctrl+Alt+Space", "Toggle recording"),
+            ("Ctrl+Alt+P", "Toggle auto-paste"),
+            ("Ctrl+Alt+C", "Copy all history"),
+            ("Ctrl+Alt+H", "Hide / show overlay"),
+            ("Ctrl+Alt+Q", "Quit"),
+        ]
+        for key, desc in lines:
+            row = tk.Frame(tw, bg="#2a2a3e")
+            row.pack(fill="x", padx=8, pady=1)
+            tk.Label(
+                row, text=key, fg="#aaaacc", bg="#2a2a3e",
+                font=("Consolas", 9), anchor="w", width=18,
+            ).pack(side="left")
+            tk.Label(
+                row, text=desc, fg="#888899", bg="#2a2a3e",
+                font=("Segoe UI", 9), anchor="w",
+            ).pack(side="left")
+
+    def _hide_hotkey_tooltip(self, event):
+        if self._tooltip:
+            self._tooltip.destroy()
+            self._tooltip = None
 
     # -- copy / clear -------------------------------------------------------
 
@@ -537,7 +582,7 @@ class VoiceType:
             entries = load_history_file(self.history_path, args.max_history)
             if entries:
                 self.overlay.seed_history(entries)
-                print(f"[voice-type] Loaded {len(entries)} history entries")
+                print(f"[hotmic] Loaded {len(entries)} history entries")
 
         # -- RealtimeSTT -----------------------------------------------------
         self.recorder = None
@@ -573,7 +618,7 @@ class VoiceType:
             text=f"Ready \u2014 {self.hotkey} to dictate",
             status=Status.IDLE,
         )
-        print(f"[voice-type] Recorder ready  model={self.model}  device={self.device}")
+        print(f"[hotmic] Recorder ready  model={self.model}  device={self.device}")
 
     # -- RealtimeSTT callbacks ----------------------------------------------
 
@@ -639,7 +684,7 @@ class VoiceType:
         self.auto_paste = not self.auto_paste
         self.overlay.update(auto_paste=self.auto_paste)
         state = "on" if self.auto_paste else "off"
-        print(f"[voice-type] Auto-paste {state}")
+        print(f"[hotmic] Auto-paste {state}")
 
     def _copy_all(self):
         self.overlay.request_copy_all()
@@ -656,7 +701,7 @@ class VoiceType:
         kb.add_hotkey(self.HIDE_HOTKEY, self._toggle_overlay, suppress=True)
         kb.add_hotkey(self.QUIT_HOTKEY, self._request_quit, suppress=True)
 
-        print("[voice-type] Hotkeys:")
+        print("[hotmic] Hotkeys:")
         print(f"  {self.hotkey}  \u2014  toggle recording")
         print(f"  {self.PASTE_TOGGLE_HOTKEY}  \u2014  toggle auto-paste")
         print(f"  {self.COPY_ALL_HOTKEY}  \u2014  copy all history to clipboard")
@@ -670,11 +715,11 @@ class VoiceType:
         self.root.after(0, self.shutdown)
 
     def run(self):
-        print("[voice-type] Starting\u2026")
+        print("[hotmic] Starting\u2026")
         self.root.mainloop()
 
     def shutdown(self):
-        print("[voice-type] Shutting down\u2026")
+        print("[hotmic] Shutting down\u2026")
         import keyboard as kb
         try:
             kb.unhook_all()
@@ -700,7 +745,7 @@ class VoiceType:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Voice Type \u2014 Whisper-powered voice dictation",
+        description="HotMic \u2014 Whisper-powered voice dictation",
     )
     p.add_argument(
         "--hotkey", default="ctrl+alt+space",
@@ -744,9 +789,13 @@ def _post_process_args(args: argparse.Namespace) -> argparse.Namespace:
 
 def main():
     if platform.system() != "Windows":
-        print("Error: voice_type.py must be run with Windows Python (python.exe).")
-        print("From WSL, run:  python.exe voice_type.py")
+        print("Error: HotMic must be run with Windows Python (python.exe).")
+        print("From WSL, run:  ./hotmic")
         raise SystemExit(1)
+
+    # Ensure CWD is the project directory — Start Menu shortcuts default to
+    # system32, which causes permission errors for log files and model caches.
+    os.chdir(SCRIPT_DIR)
 
     from dotenv import load_dotenv
     load_dotenv(SCRIPT_DIR / ".env")

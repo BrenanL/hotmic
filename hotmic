@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# hotmic — launcher for HotMic (Whisper-powered voice dictation)
+#
+# Auto-detects Windows Python, installs dependencies on first run,
+# and forwards all CLI arguments to voice_type.py.
+#
+# Usage:
+#   ./hotmic                     # launch with defaults
+#   ./hotmic --no-auto-paste     # launch with args
+#   ./hotmic --install           # one-time: add to PATH + Start Menu
+#   ./hotmic --uninstall         # remove PATH symlink + Start Menu entry
+
+set -euo pipefail
+
+# Resolve the real directory of this script (follows symlinks)
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+SCRIPT_PY="$SCRIPT_DIR/voice_type.py"
+
+# package-name:import-name (when they differ)
+DEPS=(RealtimeSTT keyboard python-dotenv:dotenv requests)
+
+# ── Windows Python detection ──────────────────────────────────────────────
+
+find_python() {
+    # 1. py.exe launcher (most reliable — comes with standard Python installs)
+    if command -v py.exe &>/dev/null; then
+        PY="$(command -v py.exe)"
+        if "$PY" -3 --version &>/dev/null; then
+            echo "$PY" -3
+            return
+        fi
+    fi
+
+    # 2. python.exe on PATH (WSL interop exposes Windows PATH)
+    if command -v python.exe &>/dev/null; then
+        local p
+        p="$(command -v python.exe)"
+        # Make sure it's actually Windows Python, not a WSL shim
+        if [[ "$p" == /mnt/* ]] && "$p" --version &>/dev/null; then
+            echo "$p"
+            return
+        fi
+    fi
+
+    # 3. Scan common install locations
+    local candidate
+    for candidate in \
+        /mnt/c/Users/*/AppData/Local/Programs/Python/Python3*/python.exe \
+        /mnt/c/Python3*/python.exe \
+        /mnt/c/Program\ Files/Python3*/python.exe; do
+        if [[ -x "$candidate" ]]; then
+            echo "$candidate"
+            return
+        fi
+    done
+
+    return 1
+}
+
+# ── Dependency check / install ────────────────────────────────────────────
+
+ensure_deps() {
+    local py=("$@")
+    local missing=()
+
+    for entry in "${DEPS[@]}"; do
+        local pip_name="${entry%%:*}"
+        local import_name="${entry##*:}"  # same as pip_name if no colon
+        if ! "${py[@]}" -c "import importlib; importlib.import_module('${import_name}')" &>/dev/null; then
+            missing+=("$pip_name")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Installing missing dependencies: ${missing[*]}"
+        "${py[@]}" -m pip install --quiet "${missing[@]}"
+    fi
+}
+
+# ── Install / Uninstall ──────────────────────────────────────────────────
+
+LINK_PATH="$HOME/.local/bin/hotmic"
+# Auto-detect Windows user profile for Start Menu path
+WIN_APPDATA="$(cmd.exe /C "echo %APPDATA%" 2>/dev/null | tr -d '\r')" || true
+if [[ -n "$WIN_APPDATA" ]]; then
+    START_MENU="$(wslpath "$WIN_APPDATA")/Microsoft/Windows/Start Menu/Programs"
+else
+    START_MENU="/mnt/c/Users/$(whoami)/AppData/Roaming/Microsoft/Windows/Start Menu/Programs"
+fi
+LNK_PATH="$START_MENU/HotMic.lnk"
+# Icon needs to live on a Windows-native path (not WSL UNC) for Shell to display it
+WIN_LOCALAPPDATA="$(cmd.exe /C "echo %LOCALAPPDATA%" 2>/dev/null | tr -d '\r')" || true
+if [[ -n "$WIN_LOCALAPPDATA" ]]; then
+    ICO_DIR="$(wslpath "$WIN_LOCALAPPDATA")/HotMic"
+else
+    ICO_DIR="/mnt/c/Users/$(whoami)/AppData/Local/HotMic"
+fi
+ICO_PATH="$ICO_DIR/hotmic.ico"
+# Also track old .bat for cleanup during uninstall
+OLD_BAT_PATH="$START_MENU/Voice Type.bat"
+
+do_install() {
+    local py=("$@")
+    echo "Installing HotMic..."
+
+    # 1. Symlink to ~/.local/bin
+    mkdir -p "$HOME/.local/bin"
+    if [[ -L "$LINK_PATH" ]]; then
+        rm "$LINK_PATH"
+    fi
+    ln -s "$SCRIPT_DIR/hotmic" "$LINK_PATH"
+    echo "  Symlinked: $LINK_PATH"
+
+    # 2. Install Python deps
+    ensure_deps "${py[@]}"
+    echo "  Python dependencies: OK"
+
+    # 3. Create VBS launcher + Windows Start Menu shortcut (.lnk)
+    local win_py
+    win_py=$("${py[@]}" -c "import sys; print(sys.executable)" | tr -d '\r')
+    local win_script
+    win_script="$(wslpath -w "$SCRIPT_PY")"
+    local win_dir
+    win_dir="$(wslpath -w "$SCRIPT_DIR")"
+
+    # Copy icon to Windows-native path so Shell can display it
+    mkdir -p "$ICO_DIR"
+    cp "$SCRIPT_DIR/hotmic.ico" "$ICO_PATH"
+    local win_ico
+    win_ico="$(wslpath -w "$ICO_PATH")"
+
+    # Create a VBS launcher that runs python.exe without a console window
+    local vbs_path="$ICO_DIR/hotmic.vbs"
+    cat > "$vbs_path" <<VBS
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run """$win_py"" ""$win_script""", 0, False
+VBS
+    local win_vbs
+    win_vbs="$(wslpath -w "$vbs_path")"
+
+    # Point .lnk at wscript.exe running the VBS (no console flash)
+    local win_lnk
+    win_lnk="$(wslpath -w "$LNK_PATH")"
+    powershell.exe -NoProfile -Command '$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut("'"$win_lnk"'"); $s.TargetPath = "wscript.exe"; $s.Arguments = """'"$win_vbs"'"""; $s.WorkingDirectory = "'"$win_dir"'"; $s.IconLocation = "'"$win_ico"'"; $s.Description = "HotMic - Whisper-powered voice dictation"; $s.Save()'
+    echo "  Start Menu shortcut: HotMic"
+
+    # Clean up old .bat if it exists
+    [[ -f "$OLD_BAT_PATH" ]] && rm "$OLD_BAT_PATH"
+
+    echo ""
+    echo "Done! You can now:"
+    echo "  - Terminal:  hotmic [options]"
+    echo "  - Win+S:     type \"HotMic\" and hit Enter"
+}
+
+do_uninstall() {
+    echo "Uninstalling HotMic..."
+
+    if [[ -L "$LINK_PATH" ]]; then
+        rm "$LINK_PATH"
+        echo "  Removed symlink: $LINK_PATH"
+    else
+        echo "  No symlink found at $LINK_PATH"
+    fi
+
+    if [[ -f "$LNK_PATH" ]]; then
+        rm "$LNK_PATH"
+        echo "  Removed Start Menu shortcut"
+    else
+        echo "  No Start Menu shortcut found"
+    fi
+
+    if [[ -d "$ICO_DIR" ]]; then
+        rm -rf "$ICO_DIR"
+        echo "  Removed icon: $ICO_DIR"
+    fi
+
+    # Clean up old .bat if it exists
+    if [[ -f "$OLD_BAT_PATH" ]]; then
+        rm "$OLD_BAT_PATH"
+        echo "  Removed old .bat entry"
+    fi
+
+    echo "Done."
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────
+
+# Find Windows Python
+read -ra PY_CMD <<< "$(find_python)" || {
+    echo "Error: Could not find Windows Python." >&2
+    echo "" >&2
+    echo "Install it with:" >&2
+    echo "  powershell.exe -Command \"winget install Python.Python.3.12\"" >&2
+    echo "" >&2
+    echo "Then restart your WSL session and try again." >&2
+    exit 1
+}
+
+case "${1:-}" in
+    --install)
+        do_install "${PY_CMD[@]}"
+        exit 0
+        ;;
+    --uninstall)
+        do_uninstall
+        exit 0
+        ;;
+esac
+
+# Normal launch — ensure deps, then run
+ensure_deps "${PY_CMD[@]}"
+exec "${PY_CMD[@]}" "$SCRIPT_PY" "$@"

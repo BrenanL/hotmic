@@ -1,49 +1,34 @@
-# Voice Type
+# HotMic
 
 Whisper-powered voice dictation for Windows. Push a hotkey, speak, see live transcription in a small overlay. All transcriptions are saved to a persistent history log. Optionally auto-pastes into the active window, or just accumulates — click any entry to copy it.
 
-## Prerequisites
-
-- **Windows Python 3.10+** — must run with Windows Python (not WSL Python) for mic access, hotkeys, and clipboard.
-
-### Install Windows Python (if not already installed)
-
-From WSL or PowerShell:
-```bash
-powershell.exe -Command "winget install Python.Python.3.12"
-```
-
-## Setup
+## Quick Start
 
 ```bash
-cd /home/user/tmp/voice-type
-
-# Full path (works immediately):
-PYWIN="/mnt/c/Users/User/AppData/Local/Programs/Python/Python312/python.exe"
-$PYWIN -m pip install RealtimeSTT keyboard python-dotenv requests
-
-# Or after restarting your WSL session (PATH was updated):
-python.exe -m pip install RealtimeSTT keyboard python-dotenv requests
+git clone <repo-url>
+cd voice-type
+./hotmic --install
 ```
+
+That's it. The installer auto-detects Windows Python, installs dependencies, and sets up:
+- **Terminal:** `hotmic` from any directory
+- **Win+S:** type "HotMic" and hit Enter
+
+### Prerequisites
+
+- **WSL** (Ubuntu or similar)
+- **Windows Python 3.10+** — if not installed:
+  ```bash
+  powershell.exe -Command "winget install Python.Python.3.12"
+  ```
 
 ## Usage
 
-### Start
-
 ```bash
-PYWIN="/mnt/c/Users/User/AppData/Local/Programs/Python/Python312/python.exe"
-
-# Default: auto-paste on, fresh overlay
-$PYWIN voice_type.py
-
-# Start with auto-paste off
-$PYWIN voice_type.py --no-auto-paste
-
-# Load previous session's history into the overlay
-$PYWIN voice_type.py --load-history
-
-# Use a larger model on GPU
-$PYWIN voice_type.py --model small --device cuda
+hotmic                              # default: auto-paste on, fresh overlay
+hotmic --no-auto-paste              # start with auto-paste off
+hotmic --load-history               # load previous session's history
+hotmic --model small --device cuda  # larger model on GPU
 ```
 
 ### Hotkeys
@@ -110,10 +95,19 @@ A dark bar at the bottom of the screen:
 3. Press again to stop. A final transcription pass runs with the larger model.
 4. The final text is saved to `history.txt`, shown in the overlay, and optionally auto-pasted into the active window.
 
+## Uninstall
+
+```bash
+hotmic --uninstall
+```
+
+Removes the terminal symlink and Start Menu shortcut. The project folder is left untouched.
+
 ## File Structure
 
 ```
 voice-type/
+├── hotmic             # Launcher script (bash)
 ├── voice_type.py      # Main script
 ├── pyproject.toml     # Project config / dependencies
 ├── .env               # API key (gitignored)
