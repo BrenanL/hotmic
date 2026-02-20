@@ -75,7 +75,7 @@ ensure_deps() {
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo "Installing missing dependencies: ${missing[*]}"
-        "${py[@]}" -m pip install --quiet "${missing[@]}"
+        "${py[@]}" -m pip install --quiet --user "${missing[@]}"
     fi
 }
 
